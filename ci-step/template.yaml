@@ -1,0 +1,6 @@
+name: 'Container Observer PoC'
+description: 'Starts the docker container observer in the background; the post step flushes it and prints captured container spans and metrics after all tasks finish'
+definition:
+  using: 'node'
+  main: 'ci-step/main.js'
+  post: 'ci-step/post.js'
