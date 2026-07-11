@@ -9,7 +9,10 @@
 //   - classifies containers already running at startup as "pre-existing"
 //   - watches container events; on start: inspect (name, image, labels, pid)
 //   - resolves attribution: cloud.nx.task.* labels (exact, opt-in)
+//     -> NX_TASK_TARGET_* env vars passed into the container (docker run -e,
+//        compose ${VAR}, TestContainers withEnv — read from Config.Env)
 //     -> org.testcontainers.sessionId (clusters by creating process)
+//     -> com.docker.compose.project (background stacks from setup steps)
 //     -> unattributed (server-side time-overlap would apply here)
 //   - polls one-shot stats each tick; CPU%% from deltas across our own ticks,
 //     memory = usage - inactive_file (same arithmetic as `docker stats`)
@@ -20,12 +23,11 @@
 //
 //	OBS_DOCKER_SOCK=$HOME/.orbstack/run/docker.sock go run .
 //
-// By default it launches two demo workloads through the plain docker CLI:
-// one labeled with cloud.nx.task.* (as a user following our docs would), one
-// unlabeled — so you see both attribution outcomes side by side.
-// OBS_DEMO=0 disables that; OBS_EXIT_AFTER_DEMO=1 exits after the demo;
-// OBS_INCLUDE_PREEXISTING=0 skips containers that predate the run (they are
-// sampled by default, attributed "pre-existing" unless labeled).
+// It observes only — nothing is launched. Start containers from your tasks
+// (or by hand) and watch them appear. Runs until SIGTERM/SIGINT, then
+// flushes spans for anything still running. OBS_INCLUDE_PREEXISTING=0 skips
+// containers that predate the run (they are sampled by default, attributed
+// "pre-existing" unless labeled).
 package main
 
 import (
@@ -33,7 +35,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
-	"os/exec"
 	"os/signal"
 	"path/filepath"
 	"sync"
@@ -73,11 +74,12 @@ func loadConfig() config {
 // ---------------------------------------------------------------------------
 
 type attribution struct {
-	Kind   string `json:"kind"`   // "task" | "testcontainers-session" | "unattributed"
-	Detail string `json:"detail"` // task id, session id, or ""
+	Kind   string `json:"kind"`          // "task" | "testcontainers-session" | "unattributed"
+	Detail string `json:"detail"`        // task id, session id, or ""
+	Via    string `json:"via,omitempty"` // "labels" | "env" — how a task attribution was resolved
 }
 
-func attributeFrom(labels map[string]string) attribution {
+func attributeFrom(labels map[string]string, env []string) attribution {
 	if project, ok := labels["cloud.nx.task.project"]; ok {
 		id := project
 		if target, ok := labels["cloud.nx.task.target"]; ok {
@@ -86,19 +88,56 @@ func attributeFrom(labels map[string]string) attribution {
 		if cfg, ok := labels["cloud.nx.task.configuration"]; ok {
 			id += ":" + cfg
 		}
-		return attribution{Kind: "task", Detail: id}
+		return attribution{Kind: "task", Detail: id, Via: "labels"}
+	}
+	// containers that received the nx-injected env vars without labels —
+	// `docker run -e NX_TASK_TARGET_PROJECT`, compose ${VAR} pass-through,
+	// TestContainers withEnv — attribute from Config.Env at inspect time
+	envMap := map[string]string{}
+	for _, kv := range env {
+		if k, v, ok := cutEnv(kv); ok {
+			envMap[k] = v
+		}
+	}
+	if project := envMap["NX_TASK_TARGET_PROJECT"]; project != "" {
+		id := project
+		if target := envMap["NX_TASK_TARGET_TARGET"]; target != "" {
+			id += ":" + target
+		}
+		if cfg := envMap["NX_TASK_TARGET_CONFIGURATION"]; cfg != "" {
+			id += ":" + cfg
+		}
+		return attribution{Kind: "task", Detail: id, Via: "env"}
 	}
 	if session, ok := labels["org.testcontainers.sessionId"]; ok {
 		return attribution{Kind: "testcontainers-session", Detail: session}
 	}
+	// background stacks from setup steps (docker compose up -d) cluster by
+	// compose project even with no task to attach to
+	if project, ok := labels["com.docker.compose.project"]; ok {
+		return attribution{Kind: "compose-project", Detail: project}
+	}
 	return attribution{Kind: "unattributed"}
+}
+
+func cutEnv(kv string) (string, string, bool) {
+	for i := 0; i < len(kv); i++ {
+		if kv[i] == '=' {
+			return kv[:i], kv[i+1:], true
+		}
+	}
+	return "", "", false
 }
 
 func (a attribution) String() string {
 	if a.Detail == "" {
 		return a.Kind
 	}
-	return a.Kind + ":" + a.Detail
+	s := a.Kind + ":" + a.Detail
+	if a.Via != "" {
+		s += " (via " + a.Via + ")"
+	}
+	return s
 }
 
 // ---------------------------------------------------------------------------
@@ -167,7 +206,7 @@ func (o *observer) track(ctx context.Context, id string, preExisting bool) {
 		return // died before we could inspect it
 	}
 	startedAt, _ := time.Parse(time.RFC3339Nano, info.State.StartedAt)
-	attr := attributeFrom(info.Config.Labels)
+	attr := attributeFrom(info.Config.Labels, info.Config.Env)
 	if preExisting && attr.Kind == "unattributed" {
 		attr = attribution{Kind: "pre-existing"}
 	}
@@ -324,45 +363,6 @@ func (o *observer) tick(ctx context.Context) {
 }
 
 // ---------------------------------------------------------------------------
-// demo workloads — plain `docker run` through the user's normal environment;
-// nothing is intercepted. The labeled one does what our docs would tell users:
-// pass NX_TASK_TARGET_* through as cloud.nx.task.* labels.
-// ---------------------------------------------------------------------------
-
-const demoScript = `i=0; while [ $i -lt 10 ]; do ` +
-	`dd if=/dev/zero of=/dev/shm/ballast.$i bs=1M count=16 2>/dev/null; ` +
-	`md5sum /dev/shm/ballast.* >/dev/null; i=$((i+1)); sleep 1; done`
-
-func runDemo(sock string, done chan<- struct{}) {
-	// simulate the env nx injects into every task process
-	fakeEnv := map[string]string{
-		"NX_TASK_TARGET_PROJECT": "my-app",
-		"NX_TASK_TARGET_TARGET":  "test",
-	}
-	labeled := exec.Command("docker", "run", "--rm", "--shm-size=256m",
-		"--name", "nx-demo-labeled",
-		"--label", "cloud.nx.task.project="+fakeEnv["NX_TASK_TARGET_PROJECT"],
-		"--label", "cloud.nx.task.target="+fakeEnv["NX_TASK_TARGET_TARGET"],
-		"alpine", "sh", "-c", demoScript)
-	unlabeled := exec.Command("docker", "run", "--rm", "--shm-size=128m",
-		"--name", "nx-demo-unlabeled",
-		"alpine", "sh", "-c",
-		`sleep 2; dd if=/dev/zero of=/dev/shm/x bs=1M count=48 2>/dev/null; md5sum /dev/shm/x >/dev/null; sleep 3`)
-
-	// pin the CLI at the same daemon the observer watches
-	env := append(os.Environ(), "DOCKER_HOST=unix://"+sock)
-	labeled.Env, unlabeled.Env = env, env
-
-	fmt.Println("[demo] starting 2 workloads: labeled (memory staircase + cpu, ~10s) and unlabeled (~6s)")
-	_ = unlabeled.Start()
-	_ = labeled.Start()
-	_ = unlabeled.Wait()
-	_ = labeled.Wait()
-	fmt.Println("[demo] workloads finished")
-	close(done)
-}
-
-// ---------------------------------------------------------------------------
 
 func main() {
 	cfg := loadConfig()
@@ -436,25 +436,10 @@ func main() {
 		}
 	}()
 
-	sigCh := make(chan os.Signal, 1)
-	signal.Notify(sigCh, syscall.SIGTERM, syscall.SIGINT)
-
-	if os.Getenv("OBS_DEMO") != "0" {
-		done := make(chan struct{})
-		go runDemo(cfg.sock, done)
-		if os.Getenv("OBS_EXIT_AFTER_DEMO") == "1" {
-			select {
-			case <-done:
-				time.Sleep(2500 * time.Millisecond) // let die events + last tick flush
-			case <-sigCh:
-			}
-			obs.shutdown()
-			return
-		}
-	}
-
 	// run until SIGTERM/SIGINT (e.g. the CI post step killing us), then
 	// flush spans for anything still running so no lifetimes are lost
+	sigCh := make(chan os.Signal, 1)
+	signal.Notify(sigCh, syscall.SIGTERM, syscall.SIGINT)
 	<-sigCh
 	fmt.Println("[observer] signal received — flushing open spans")
 	obs.shutdown()

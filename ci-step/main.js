@@ -36,7 +36,7 @@ const log = fs.openSync(path.join(dir, 'observer.log'), 'a');
 const child = spawn(bin, [], {
   detached: true,
   stdio: ['ignore', log, log],
-  env: { ...process.env, OBS_DEMO: '0', OBS_OUT_DIR: dir },
+  env: { ...process.env, OBS_OUT_DIR: dir },
 });
 fs.writeFileSync(path.join(dir, 'observer.pid'), String(child.pid));
 child.unref();
