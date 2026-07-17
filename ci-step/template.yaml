@@ -1,5 +1,9 @@
-name: 'Container Observer PoC'
-description: 'Starts the docker container observer in the background; the post step flushes it and prints captured container spans and metrics after all tasks finish'
+name: Container Observer (PoC)
+description: >
+  Runs the nrwl/ocean container observer (TS, bundled into ci-step/main.js)
+  as a background daemon for the whole workflow. The post script stops it,
+  which finalizes a container-metrics-* artifact plus .complete marker in
+  NX_CLOUD_METRICS_DIRECTORY for the workflow metrics uploader.
 definition:
   using: 'node'
   main: 'ci-step/main.js'
