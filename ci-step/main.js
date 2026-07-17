@@ -49,7 +49,7 @@ var init_nx_imports = __esm({
 process.env.NX_CLOUD_ENABLE_CONTAINER_METRICS ||= "true";
 process.env.NX_CLOUD_VERSION ||= "container-observer-poc";
 process.env.NX_CLOUD_VERBOSE_LOGGING ||= "true";
-process.env.NX_CLOUD_METRICS_DIRECTORY ||= "/tmp/metrics";
+process.env.NX_CLOUD_METRICS_DIRECTORY ||= "/var/upload/metrics";
 
 // entry.ts
 var import_child_process = require("child_process");
