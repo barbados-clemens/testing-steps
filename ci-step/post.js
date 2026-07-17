@@ -60,7 +60,29 @@ async function main() {
   }
 
   summarize(artifactFilePath);
+  dumpRaw(artifactFilePath);
   printDaemonLog();
+}
+
+// The agent-metrics route re-validates uploads and strips container-specific
+// fields (attribution, spans), so the step log carries the raw NDJSON for
+// use as a UI fixture: copy everything between the sentinels.
+function dumpRaw(artifactFilePath) {
+  const MAX_DUMP_BYTES = 2 * 1024 * 1024;
+  try {
+    const raw = readFileSync(artifactFilePath, 'utf8');
+    if (raw.length > MAX_DUMP_BYTES) {
+      console.log(
+        `[container-observer] artifact is ${raw.length} bytes; skipping raw dump`,
+      );
+      return;
+    }
+    console.log('\n----- RAW ARTIFACT BEGIN -----');
+    console.log(raw.trimEnd());
+    console.log('----- RAW ARTIFACT END -----');
+  } catch (e) {
+    console.log(`[container-observer] could not dump artifact: ${e}`);
+  }
 }
 
 function summarize(artifactFilePath) {
